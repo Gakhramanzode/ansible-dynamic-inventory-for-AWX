@@ -1,164 +1,247 @@
 #!/usr/bin/env python
 import json
-import os
 import re
 import requests
-import base64
 import yaml
+import configparser
+import os
 
-with open('inventories/my-project/group_vars/all/my-role.yml', 'r') as file:
+with open('inventories/my-project/group_vars/all/vars.yml', 'r') as file:
     variables = yaml.safe_load(file)
 
-# Заменить эти значения на свои
-GITLAB_TOKEN = variables['my_role_gitlab_private_token']
+# Replace these values with your own
+GITLAB_TOKEN = os.environ['gitlab_private_token']
 GITLAB_URL = variables['gitlab_url']
 PROJECT_ID = variables['project_id']
 INVENTORY_FILE_PATH = variables['inventory_file_path']
 HOST_VARS_PATH = variables['host_vars_path']
 BRANCH_NAME =  variables['branch_name']
 
-# Формируем URL для запроса к API GitLab
+# Creating a URL for a request to the GitLab API
 url = f'{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/repository/commits'
 params = {
     'private_token': GITLAB_TOKEN,
-    # Раскомментировать для теста
+    # Uncomment for testing
     # 'path': HOST_VARS_PATH,
     'ref_name': BRANCH_NAME,
+    # Setting the number of results per page
+    'per_page': 100,
+    # Setting the page number
+    'page': 1,
 }
 
-# Получаем данные о коммитах из GitLab
-response = requests.get(url, params=params)
-data = response.json()
-# print(data)
+all_data = []
 
-# Оставляем только два последних коммита в списке
-data = data[:2]
-# print(data)
+while True:
+    # Getting commit data from GitLab
+    response = requests.get(url, params=params)
+    data = response.json()
+    all_data.extend(data)
 
-# Инициализируем переменную для хранения измененных хостов
+    if "next" not in response.links:
+        break
+
+    params["page"] += 1
+
+# We leave only the last commit in the list
+all_data = all_data[:1]
+
+# Initialize a variable to store the changed hosts
 changed_hosts = set()
 
-# Обрабатываем каждый коммит в списке
-for commit in data:
-    # Получаем данные о изменениях в коммите
+# Processing each commit in the list
+for commit in all_data:
+    # We receive data about changes in the commit
     url = f'{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/repository/commits/{commit["id"]}/diff'
     params = {
         'private_token': GITLAB_TOKEN,
+        # Setting the number of results per page
+        'per_page': 100,
+        # Setting the page number
+        'page': 1,
     }
     response = requests.get(url, params=params)
     changes = response.json()
 
-    # Ищем изменения в каталоге host_vars
-    for change in changes:
+    all_changes = []
+
+    while True:
+        response = requests.get(url, params=params)
+        changes = response.json()
+        all_changes.extend(changes)
+
+        if "next" not in response.links:
+            break
+
+        params["page"] += 1
+
+    # Looking for changes in the host_vars directory
+    for change in all_changes:
         if change['new_path'].startswith(HOST_VARS_PATH):
-            # Извлекаем имя папки из пути к файлу
+            # Extract the folder name from the file path
             folder_name = change['new_path'].split('/')[-2]
-            # Добавляем имя папки в список измененных хостов
+            # Adding the folder name to the list of changed hosts
             changed_hosts.add(folder_name)
 
-# Формируем URL для запроса к API GitLab
-url = f'{GITLAB_URL}/api/v4/projects/{PROJECT_ID}/repository/files/inventories%2Fmy-project%2Fhosts.ini?ref={BRANCH_NAME}'
-headers = {
-    'PRIVATE-TOKEN': GITLAB_TOKEN,
-}
+config = configparser.ConfigParser(allow_no_value=True)
+config.read('inventories/my-project/hosts.ini')
 
-# Получаем содержимое файла инвентаря из GitLab
-response = requests.get(url, headers=headers)
-# Получаем JSON-объект вместо текста
-inventory_data = response.json()
-# print(inventory_data)
-
-# Декодируем содержимое файла из base64 в строку
-# Получаем поле content из JSON-объекта
-content = inventory_data["content"]
-# Декодируем содержимое из base64
-decoded = base64.b64decode(content)
-# Преобразуем байты в строку с кодировкой utf-8
-inventory_string = decoded.decode("utf-8")
-
-def get_parent_changed_hosts(changed_hosts, inventory_string):
-    # Инициализируем словарь, чтобы сохранить имя группы для каждого хоста
+def get_parent_changed_hosts(changed_hosts, config):
+    # Initialize the dictionary to save the group name for each host
     host_groups = {}
 
-    # Анализируем файл host.ini, чтобы найти имя группы для каждого хоста:
-    group_name = None
-    for line in inventory_string.splitlines():
-        # Проверяем, является ли строка заголовком группы и не содержит ли она подстроку :children
-        if line.startswith('[') and line.endswith(']') and ':children' not in line:
-            # Извлекаем название группы
-            group_name = line[1:-1]
-            # print(group_name)
-        else:
-            # Извлекаем имя хоста из строки, используя регулярное выражение
-            match = re.search(r'^(?<!#)\s*([\w\.-]+(?:\[[^\]]+\])?[\w\.-]*)(?:\s+ansible_host=\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:\s+\w+=\w+)*)?(?:\s*#.*)?\s*$', line)
-            if match:
-                host = match.group(1)
-                # Проверем, находится ли этот хост в наборе changed_hosts
-                if host in changed_hosts and group_name is not None:
-                    # Сохраняем имя группы для этого хоста
-                    host_groups[host] = group_name
+    # Pass through all sections in the file
+    for section in config.sections():
+        # Checking whether a section is a host group
+        if ':children' not in section:
+            # Passage by all parameters in the section
+            for option in config.options(section):
+                # Getting the host name from the parameter
+                host = option.split()[0]
+                # Saving group information for the host
+                host_groups[host] = section
 
-    # Инициализируем словарь для хранения родительской группы для каждой группы
+    # Initialize the dictionary to store the parent group for each group
     parent_groups = {}
 
-    # Анализируем файл инвентаризации
-    parent_group_name = None
-    for line in inventory_string.splitlines():
-        # Проверяем, является ли строка заголовком родительской группы
-        if line.startswith('[') and ':children' in line:
-            # Извлекаем название родительской группы
-            parent_group_name = line[1:line.index(':')]
-        elif line.startswith('['):
-            # Сбрасываем имя родительской группы для групп, не являющихся родительскими
-            parent_group_name = None
-        else:
-            # Проверяем, есть ли какая-либо из групп в этой строке
-            for group in set(host_groups.values()):
-                if group == line.strip() and parent_group_name is not None:
-                    # Сохраняем имя родительской группы для этой группы
+    # Pass through all sections in the file
+    for section in config.sections():
+        # Checking whether a section is a parent group
+        if ':children' in section:
+            # Getting the name of the parent group from the section name
+            parent_group_name = section.split(':')[0]
+            # Passage by all parameters in the section
+            for option in config.options(section):
+                # Getting the group name from a parameter
+                group = option.strip()
+                # Checking if there is such a group in the host_groups dictionary
+                if group in host_groups.values():
+                    # Saving parent group information for a group
                     parent_groups[group] = parent_group_name
 
-    # Инициализируем словарь для хранения измененных хостов для каждой родительской группы
+    # Initialize the dictionary to store the changed hosts for each parent group
     parent_changed_hosts = {}
 
-    # Группируем измененные хосты по их родительской группе
+    # Grouping the modified hosts by their parent group
     for host in changed_hosts:
-        # Получаем имя родительской группы для этого хоста
+        # Getting the name of the parent group for this host
         parent_group = parent_groups.get(host_groups.get(host))
         if parent_group is not None:
-            # Добавляем этот хост в список измененных хостов для этой родительской группы
+            # Adding this host to the list of changed hosts for this parent group
             if parent_group not in parent_changed_hosts:
                 parent_changed_hosts[parent_group] = []
             parent_changed_hosts[parent_group].append(host)
 
     return parent_changed_hosts
 
-# Раскомментировать для теста
-# Инициализируем переменную для хранения измененных хостов
+# Uncomment for testing
+# Initialize a variable to store the changed hosts
 # changed_hosts = set()
 
 if not changed_hosts:
-    # Ищем хосты в декодированной строке
-    all_hosts = re.findall(r'^(?<!#)\s*([\w\.-]+(?:\[[^\]]+\])?[\w\.-]*)(?:\s+ansible_host=\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:\s+\w+=\w+)*)?(?:\s*#.*)?\s*$', inventory_string, re.MULTILINE)
-    changed_hosts = set(all_hosts)
-    # print(changed_hosts)
-    parent_changed_hosts = get_parent_changed_hosts(changed_hosts, inventory_string)
+    # Initialize the set to store all hosts
+    all_hosts = set()
+    # Pass through all sections in the file
+    for section in config.sections():
+        # Checking whether a section is a host group
+        if ':children' not in section:
+            # Passage by all parameters in the section
+            for option in config.options(section):
+                # Getting the host name from the parameter
+                host = option.split()[0]
+                # Adding a host to a set
+                all_hosts.add(host)
+    changed_hosts = all_hosts
+    parent_changed_hosts = get_parent_changed_hosts(changed_hosts, config)
 else:
-    parent_changed_hosts = get_parent_changed_hosts(changed_hosts, inventory_string)
+    parent_changed_hosts = get_parent_changed_hosts(changed_hosts, config)
 
-# Обновляем данные динамической инвентаризации
+# Creating a dictionary to store information about host parameters
+host_vars = {}
+
+# Function for converting a string to the corresponding value
+def parse_value(value):
+    if value.lower() == 'true':
+        return True
+    elif value.lower() == 'false':
+        return False
+    elif value.isdigit():
+        return int(value)
+    else:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+# Pass through all sections in the file
+for section in config.sections():
+    # Checking whether a section is a host group
+    if ':children' not in section:
+        # Passage by all parameters in the section
+        for option in config.options(section):
+            # Getting the host name from the parameter
+            host = option.split()[0]
+            # Checking whether this host is changed
+            if host in changed_hosts:
+                # Getting the parameter value
+                value = config.get(section, option)
+                # Saving parameter information for the host
+                if value is not None:
+                    if host not in host_vars:
+                        host_vars[host] = {}
+                    # Using only the parameter name without the hostname
+                    option_parts = option.split('=')[0].split()
+                    if len(option_parts) > 1:
+                        param_name = option_parts[1].strip()
+                    else:
+                        param_name = option_parts[0].strip()
+                    # Splitting the value into separate parameters
+                    value_parts = re.split(r'\s+#\s+', value)[0].split()
+                    for value_part in value_parts:
+                        if '=' in value_part:
+                            param_name, param_value = value_part.split('=', 1)
+                            host_vars[host][param_name.strip()] = parse_value(param_value.strip())
+                        else:
+                            host_vars[host][param_name] = parse_value(value_part.strip())
+
+
+# Updating dynamic inventory data
 inventory = {
     "_meta": {
-        "hostvars": {}
+        "hostvars": host_vars
     },
     "all": {
         "children": list(parent_changed_hosts.keys())
     }
 }
+
+# Initialize the dictionary to save the group name for each host
+host_groups = {}
+
+# Pass through all sections in the file
+for section in config.sections():
+    # Checking whether a section is a host group
+    if ':children' not in section:
+        # Passage by all parameters in the section
+        for option in config.options(section):
+            # Getting the host name from the parameter
+            host = option.split()[0]
+            # Saving group information for the host
+            host_groups[host] = section
+
 for parent_group, hosts in parent_changed_hosts.items():
     inventory[parent_group] = {
-        "hosts": hosts
+        "children": []
     }
+    for host in hosts:
+        group = host_groups.get(host)
+        if group not in inventory[parent_group]["children"]:
+            inventory[parent_group]["children"].append(group)
+        if group not in inventory:
+            inventory[group] = {
+                "hosts": []
+            }
+        inventory[group]["hosts"].append(host)
 
-# Выводим данные в формате JSON
+# Output data in JSON format
 print(json.dumps(inventory))
